@@ -274,12 +274,12 @@ function X:auth:read {
 # }}}
 
 integer -g DISPLAY_FD
-local -A options
+local -A args
 
 while true; do
 	case "$1" in
 		-display)
-			options[display]="$2"
+			args[display]="$2"
 
 			shift 2 ;;
 
@@ -287,6 +287,6 @@ while true; do
 	esac
 done
 
-X:connect "$options[display]"
+X:connect "$args[display]"
 
 # vim: ft=zsh sts=2 ts=2 sw=2 noet fdm=marker fmr={{{,}}}
