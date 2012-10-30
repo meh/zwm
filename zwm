@@ -1,0 +1,292 @@
+#! /bin/zsh
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#                    Version 2, December 2004
+#
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+#
+#  0. You just DO WHAT THE FUCK YOU WANT TO.
+
+# Initialization {{{
+emulate -L zsh
+
+zmodload -i zsh/net/socket
+zmodload -i zsh/system
+zmodload -i zsh/zselect
+# }}}
+
+# Misc Helpers {{{
+function warn {
+	print -- "$*" >&2
+}
+
+function assign {
+	typeset -g "$1=$2"
+}
+# }}}
+
+# X Helpers {{{
+function X:dial {
+	local display
+	local screen
+	local socket
+	local protocol
+
+	local -a parts
+	parts=("${(@s[:])1:-$DISPLAY}")
+
+	if (( $#parts == 2 )); then
+		if [[ "${${parts[1]}[1]}" == '/' ]]; then
+			display="${parts[2]}"
+			socket="${parts[1]}:"
+			protocol='unix'
+		else
+			# TODO: implement other protocols
+		fi
+	else
+		display="$parts[1]"
+		socket='/tmp/.X11-unix/X'
+		protocol='unix'
+	fi
+
+	parts=(${(@s[.])parts[-1]})
+	display="$parts[1]"
+	screen="$parts[2]"
+
+	case "$protocol" in
+		unix) zsocket "$socket$display" DISPLAY_FD || return $? ;;
+
+		*) return 1 ;;
+	esac
+}
+
+function X:connect {
+	X:dial $1 || return 1
+	X:auth:read || return 1
+
+	X:packet:setup-request:write \
+		endianness little \
+\
+		protocol.version.major 11 \
+		protocol.version.minor 0 \
+\
+		auth.name "$reply[name]" \
+		auth.data "$reply[data]"
+}
+
+function X:write {
+	syswrite -o $DISPLAY_FD "$*"
+}
+
+function X:read {
+	sysread -i $DISPLAY_FD -s "$1" ${=2}
+}
+
+# Types {{{
+function X:type:CARD8:write {
+	local encoded="\x$(( [##16] $1 & 0xff ))"
+
+	X:write "${(g::)encoded}"
+}
+
+function X:type:CARD8:read {
+	X:read 1
+
+	assign "${1:-REPLY}" "$(( #REPLY ))"
+}
+
+function X:type:CARD16:write {
+	local encoded="\x$(( [##16] $1 & 0xff ))\x$(( [##16] ($1 >> 8) & 0xff))"
+
+	X:write "${(g::)encoded}"
+}
+
+function X:type:CARD16:read {
+	X:read 2
+
+	local first="$REPLY[1]"
+	local second="$REPLY[2]"
+
+	assign "${1:-REPLY}" "$(( #second << 8 | #first ))"
+}
+
+function X:type:STRING8:write {
+	# add padding
+	repeat $(( (4 - ($#1 % 4)) % 4 )) 1+=$'\0'
+
+	X:write "$1"
+}
+
+function X:type:STRING8:read {
+	X:read $(( $argv[-1] + (4 - ($argv[-1] % 4) % 4) ))
+
+	REPLY="$REPLY[1,-$(( (4 - ($argv[-1] % 4) % 4) + 1 ))]"
+
+	if (( $+2 )); then
+		assign $1 "$REPLY"
+	fi
+}
+# }}}
+
+# Packets {{{
+function X:packet:setup {
+	typeset -gA data
+
+	if (( ! $+2 )); then
+		data=("${(@P)1}")
+	else
+		data=("$@")
+	fi
+}
+
+function X:packet:setup-request:write {
+	local -A data
+
+	X:packet:setup "$@"
+
+	# the first byte tells the endianness to use: B for big, l for little
+	if [[ "${data[endianness]:l}" == 'big' ]]; then
+		X:write 'B'
+	elif [[ "${data[endianness]:l}" == 'little' ]]; then
+		X:write 'l'
+	else
+		return 1
+	fi
+
+	# there's an unused byte
+	X:write $'\0'
+
+	# the major and minor version for the protocol we talk
+	X:type:CARD16:write "$data[protocol.version.major]"
+	X:type:CARD16:write "$data[protocol.version.minor]"
+
+	# the length of the auth name and auth data
+	X:type:CARD16:write "$#data[auth.name]"
+	X:type:CARD16:write "$#data[auth.data]"
+
+	# two unused bytes
+	X:write $'\0\0'
+
+	# and the 4 bytes padded auth name and auth data
+	X:type:STRING8:write "$data[auth.name]"
+	X:type:STRING8:write "$data[auth.data]"
+}
+
+function X:packet:setup:read {
+	integer code
+
+	X:type:CARD8:read code
+
+	# Failure
+	if (( $code == 0 )); then
+		integer reason_length
+		integer major
+		integer minor
+		local reason
+
+		X:type:CARD8:read reason_length
+		X:type:CARD16:read major
+		X:type:CARD16:read minor
+		X:type:CARD16:read # what's this length for?
+		X:type:STRING8:read reason $reason_length
+
+		set -A ${1:-reply} protocol.version.major $major protocol.version.minor $minor reason "$reason"
+		return 1
+	fi
+
+	# Authenticate
+	if (( $code == 2 )); then
+		integer length
+		local reason
+
+		X:read 5
+		X:type:CARD16:read length
+		X:type:STRING8:read reason $(( length * 4 ))
+
+		set -A ${1:-reply} reason "$reason"
+		return 2
+	fi
+
+	X:read 1
+
+}
+# }}}
+
+# Authentication {{{
+function X:auth:read-short {
+	integer fd="$2"
+	local encoded
+
+	sysread -i $fd -s 2 encoded || return $?
+
+	local first="$encoded[1]"
+	local second="$encoded[2]"
+
+	assign "${1:-REPLY}" "$(( #first << 8 | #second ))"
+}
+
+function X:auth:read-string {
+	integer fd="$2"
+	integer length
+
+	X:auth:read-short length "$fd"
+	sysread -i $fd -s $length $1 || return $?
+}
+
+function X:auth:read {
+	local display="$2"
+	local hostname="${3:-$HOST}"
+	local authority="${XAUTHORITY:-$HOME/.Xauthority}"
+	integer fd
+
+	exec {fd}<"$authority"
+
+	if [[ -z $fd ]]; then
+		return 1
+	fi
+
+	integer family
+	local addr
+	local disp
+	local name
+	local data
+
+	while true; do
+		X:auth:read-short  family $fd || break
+		X:auth:read-string addr   $fd || break
+		X:auth:read-string disp   $fd || break
+		X:auth:read-string name   $fd || break
+		X:auth:read-string data   $fd || break
+
+		if [[ "$family" == 256 && "$addr" == "$hostname" && "$disp" == "$display" ]]; then
+			set -A "${1:-reply}" name "$name" data "$data"
+
+			break
+		fi
+	done
+
+	exec {fd}>&-
+
+	(( ${#${(P)1:-reply}} ))
+}
+# }}}
+
+# }}}
+
+integer -g DISPLAY_FD
+local -A options
+
+while true; do
+	case "$1" in
+		-display)
+			options[display]="$2"
+
+			shift 2 ;;
+
+		*) break ;;
+	esac
+done
+
+X:connect "$options[display]"
+
+# vim: ft=zsh sts=2 ts=2 sw=2 noet fdm=marker fmr={{{,}}}
