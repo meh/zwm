@@ -13,6 +13,8 @@ emulate -L zsh
 zmodload -i zsh/net/socket
 zmodload -i zsh/system
 zmodload -i zsh/zselect
+
+# setopt XTRACE
 # }}}
 
 # Misc Helpers {{{
@@ -20,8 +22,8 @@ function warn {
 	print -- "$*" >&2
 }
 
-function assign {
-	typeset -g "$1=$2"
+function is-true {
+	[[ "$1" == (1|[Yy]([Ee][Ss]|)|[Tt]([Rr][Uu][Ee]|)|[Oo]([Nn]|)) ]]
 }
 # }}}
 
@@ -35,7 +37,7 @@ function X:dial {
 	local -a parts
 	parts=("${(@s[:])1:-$DISPLAY}")
 
-	if (( $#parts == 2 )); then
+	if [[ -n $parts[1] ]]; then
 		if [[ "${${parts[1]}[1]}" == '/' ]]; then
 			display="${parts[2]}"
 			socket="${parts[1]}:"
@@ -53,8 +55,13 @@ function X:dial {
 	display="$parts[1]"
 	screen="$parts[2]"
 
+	integer REPLY
 	case "$protocol" in
-		unix) zsocket "$socket$display" DISPLAY_FD || return $? ;;
+		unix)
+			zsocket "$socket$display" || return $?
+			DISPLAY_FD=$REPLY
+
+			;;
 
 		*) return 1 ;;
 	esac
@@ -64,14 +71,27 @@ function X:connect {
 	X:dial $1 || return 1
 	X:auth:read || return 1
 
-	X:packet:setup-request:write \
-		endianness little \
+	X:packet:setup:write \
+		endianness big \
 \
 		protocol.version.major 11 \
 		protocol.version.minor 0 \
 \
 		auth.name "$reply[name]" \
 		auth.data "$reply[data]"
+
+	local -A setup
+	X:packet:setup:read setup
+
+	if (( $setup[protocol.version.major] < 11 )); then
+		warn 'WHAT YEAR IS THIS?!?!?'
+		exit 1
+	fi
+
+	if (( $setup[protocol.version.major] > 11 )); then
+		warn 'Tell me about the future.'
+		exit 1
+	fi
 }
 
 function X:write {
@@ -79,51 +99,116 @@ function X:write {
 }
 
 function X:read {
-	sysread -i $DISPLAY_FD -s "$1" ${=2}
+	sysread -i $DISPLAY_FD -s "$1" $2
 }
 
 # Types {{{
-function X:type:CARD8:write {
+function X:XID:write {
+	if (( (($1 >> 24) & 0xff) >> 6 != 0 )); then
+		warn 'XID: top three bits must be 0'
+		return 1
+	fi
+
+	local encoded="\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
+
+	X:write "${(g::)encoded}"
+}
+
+alias X:WINDOW:write=X:XID:write
+alias X:COLORMAP:write=X:XID:write
+
+function X:XID:read {
+	X:read 4
+
+	local first="$REPLY[1]"
+	local second="$REPLY[2]"
+	local third="$REPLY[3]"
+	local fourth="$REPLY[3]"
+
+	typeset -g "${1:-REPLY}=$(( #first << 24 | #second << 16 | #third << 8 | #fourth ))"
+}
+
+alias X:WINDOW:read=X:XID:read
+alias X:COLORMAP:read=X:XID:read
+
+function X:BOOL:write {
+	if is-true "$1"; then
+		X:CARD8:write 1
+	else
+		X:CARD8:write 0
+	fi
+}
+
+function X:BOOL:read {
+	X:CARD8:read
+}
+
+function X:CARD8:write {
 	local encoded="\x$(( [##16] $1 & 0xff ))"
 
 	X:write "${(g::)encoded}"
 }
 
-function X:type:CARD8:read {
+alias X:BYTE:write=X:CARD8:write
+
+function X:CARD8:read {
 	X:read 1
 
-	assign "${1:-REPLY}" "$(( #REPLY ))"
+	typeset -g "${1:-REPLY}=$(( #REPLY ))"
 }
 
-function X:type:CARD16:write {
-	local encoded="\x$(( [##16] $1 & 0xff ))\x$(( [##16] ($1 >> 8) & 0xff))"
+alias X:BYTE:read=X:CARD8:read
+
+function X:CARD16:write {
+	local encoded="\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
 
 	X:write "${(g::)encoded}"
 }
 
-function X:type:CARD16:read {
+function X:CARD16:read {
 	X:read 2
 
 	local first="$REPLY[1]"
 	local second="$REPLY[2]"
 
-	assign "${1:-REPLY}" "$(( #second << 8 | #first ))"
+	typeset -g "${1:-REPLY}=$(( #first << 8 | #second ))"
 }
 
-function X:type:STRING8:write {
+function X:CARD32:write {
+	local encoded="\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
+
+	X:write "${(g::)encoded}"
+}
+
+alias X:VISUALID:write=X:CARD32:write
+
+function X:CARD32:read {
+	X:read 4
+
+	local first="$REPLY[1]"
+	local second="$REPLY[2]"
+	local third="$REPLY[3]"
+	local fourth="$REPLY[3]"
+
+	typeset -g "${1:-REPLY}=$(( #first << 24 | #second << 16 | #third << 8 | #fourth ))"
+}
+
+alias X:VISUALID:read=X:CARD32:read
+
+function X:STRING8:write {
 	# add padding
 	repeat $(( (4 - ($#1 % 4)) % 4 )) 1+=$'\0'
 
 	X:write "$1"
 }
 
-function X:type:STRING8:read {
+function X:STRING8:read {
 	X:read $(( $argv[-1] + (4 - ($argv[-1] % 4) % 4) ))
 
 	REPLY="$REPLY[1,-$(( (4 - ($argv[-1] % 4) % 4) + 1 ))]"
 
 	if (( $+2 )); then
-		assign $1 "$REPLY"
+		typeset -g "$1=$REPLY"
 	fi
 }
 # }}}
@@ -139,7 +224,7 @@ function X:packet:setup {
 	fi
 }
 
-function X:packet:setup-request:write {
+function X:packet:setup:write {
 	local -A data
 
 	X:packet:setup "$@"
@@ -157,58 +242,137 @@ function X:packet:setup-request:write {
 	X:write $'\0'
 
 	# the major and minor version for the protocol we talk
-	X:type:CARD16:write "$data[protocol.version.major]"
-	X:type:CARD16:write "$data[protocol.version.minor]"
+	X:CARD16:write "$data[protocol.version.major]"
+	X:CARD16:write "$data[protocol.version.minor]"
 
 	# the length of the auth name and auth data
-	X:type:CARD16:write "$#data[auth.name]"
-	X:type:CARD16:write "$#data[auth.data]"
+	X:CARD16:write "$#data[auth.name]"
+	X:CARD16:write "$#data[auth.data]"
 
 	# two unused bytes
 	X:write $'\0\0'
 
 	# and the 4 bytes padded auth name and auth data
-	X:type:STRING8:write "$data[auth.name]"
-	X:type:STRING8:write "$data[auth.data]"
+	X:STRING8:write "$data[auth.name]"
+	X:STRING8:write "$data[auth.data]"
 }
 
 function X:packet:setup:read {
+	: ${1:=reply}
+
 	integer code
 
-	X:type:CARD8:read code
+	X:CARD8:read code
 
 	# Failure
 	if (( $code == 0 )); then
 		integer reason_length
-		integer major
-		integer minor
-		local reason
 
-		X:type:CARD8:read reason_length
-		X:type:CARD16:read major
-		X:type:CARD16:read minor
-		X:type:CARD16:read # what's this length for?
-		X:type:STRING8:read reason $reason_length
+		X:CARD8:read reason_length
+		X:CARD16:read "$1[protocol.version.major]"
+		X:CARD16:read "$1[protocol.version.minor]"
+		X:CARD16:read # what's this length for?
+		X:STRING8:read "$1[reason]" $reason_length
 
-		set -A ${1:-reply} protocol.version.major $major protocol.version.minor $minor reason "$reason"
 		return 1
 	fi
 
 	# Authenticate
 	if (( $code == 2 )); then
-		integer length
-		local reason
+		integer reason_length
 
 		X:read 5
-		X:type:CARD16:read length
-		X:type:STRING8:read reason $(( length * 4 ))
+		X:CARD16:read reason_length
+		X:STRING8:read "$1[reason]" $(( length * 4 ))
 
-		set -A ${1:-reply} reason "$reason"
 		return 2
 	fi
 
 	X:read 1
 
+	integer vendor_len
+	integer screens_len
+	integer pixmap_formats_len
+
+	X:CARD16:read "$1[protocol.version.major]"
+	X:CARD16:read "$1[protocol.version.minor]"
+	X:CARD16:read # unused length
+	X:CARD32:read "$1[protocol.version.release-number]"
+	X:CARD32:read "$1[resource-id.base]"
+	X:CARD32:read "$1[resource-id.mask]"
+	X:CARD32:read "$1[motion-buffer.size]"
+	X:CARD16:read vendor_len
+	X:CARD16:read "$1[request.max-length]"
+	X:CARD8:read  screens_len
+	X:CARD8:read  pixmap_formats_len
+	X:CARD8:read  "$1[image.byte-order]"
+	X:CARD8:read  "$1[bitmap-format.byte-order]"
+	X:CARD8:read  "$1[bitmap-format.scanline.unit]"
+	X:CARD8:read  "$1[bitmap-format.scanline.pad]"
+	X:CARD8:read  "$1[keycode.min]"
+	X:CARD8:read  "$1[keycode.max]"
+
+	# set the literal value for endianness: 0 is little, 1 is big
+	typeset -g "$1[image.byte-order]=${${(P)${:-$1'[image.byte-order]'}/0/little}/1/big}"
+	typeset -g "$1[bitmap-format.byte-order]=${${(P)${:-$1'[bitmap-format.byte-order]'}/0/little}/1/big}"
+
+	X:read 4
+	X:STRING8:read "$1[vendor]" $vendor_len
+
+	integer i
+	typeset -g "$1[pixmap-formats.length]=$pixmap_formats_len"
+	for (( i=1; i <= $pixmap_formats_len; ++i )); do
+		X:CARD8:read "$1[pixmap-formats.$i.depth]"
+		X:CARD8:read "$1[pixmap-formats.$i.bits-per-pixel]"
+		X:CARD8:read "$1[pixmap-formats.$i.scanline.pad]"
+		X:read 5
+	done
+
+	integer i
+	typeset -g "$1[screens.length]=$screens_len"
+	for (( i=1; i <= $screens_len; ++i )); do
+		integer allowed_depths_len
+
+		X:WINDOW:read   "$1[screens.$i.window]"
+		X:COLORMAP:read "$1[screens.$i.default-colormap]"
+		X:CARD32:read   "$1[screens.$i.pixel.white]"
+		X:CARD32:read   "$1[screens.$i.pixel.black]"
+		X:CARD32:read   "$1[screens.$i.current-input-masks]"
+		X:CARD16:read   "$1[screens.$i.width.px]"
+		X:CARD16:read   "$1[screens.$i.height.px]"
+		X:CARD16:read   "$1[screens.$i.width.mm]"
+		X:CARD16:read   "$1[screens.$i.height.mm]"
+		X:CARD16:read   "$1[screens.$i.installed-maps.min]"
+		X:CARD16:read   "$1[screens.$i.installed-maps.max]"
+		X:BYTE:read     "$1[screens.$i.backing-stores]"
+		X:BOOL:read     "$1[screens.$i.save-unders]"
+		X:CARD8:read    "$1[screens.$i.depth]"
+		X:CARD8:read    allowed_depths_len
+
+		integer j
+		typeset -g "$1[screens.$i.allowed-depths.length]=$allowed_depths_len"
+		for (( j=1; j <= $allowed_depths_len; ++j )); do
+			integer visuals_len
+
+			X:CARD8:read "$1[screens.$i.allowed-depths.$j.depth]"
+			X:read 1
+			X:CARD16:read visuals_len
+			X:read 4
+
+			integer h
+			typeset -g "$1[screens.$i.allowed-depths.$j.visuals.length]=$visuals_len"
+			for (( h=1; h <= $visuals_len; ++h )); do
+				X:VISUALID:read "$1[screens.$i.allowed-depths.$j.visuals.$h.id]"
+				X:CARD8:read    "$1[screens.$i.allowed-depths.$j.visuals.$h.class]"
+				X:CARD8:read    "$1[screens.$i.allowed-depths.$j.visuals.$h.bits-per-rgb-value]"
+				X:CARD16:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.colormap-entries]"
+				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.red]"
+				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.green]"
+				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.blue]"
+				X:read 4
+			done
+		done
+	done
 }
 # }}}
 
@@ -222,7 +386,7 @@ function X:auth:read-short {
 	local first="$encoded[1]"
 	local second="$encoded[2]"
 
-	assign "${1:-REPLY}" "$(( #first << 8 | #second ))"
+	typeset -g "${1:-REPLY}=$(( #first << 8 | #second ))"
 }
 
 function X:auth:read-string {
@@ -282,6 +446,25 @@ while true; do
 			args[display]="$2"
 
 			shift 2 ;;
+
+		-version)
+			print 'zwm 0.0.1 (http://github.com/meh/zwm)'
+
+			exit ;;
+
+		-help)
+			cat <<- HELP
+				zwm 0.0.1 (http://github.com/meh/zwm)
+				
+				-display <string>  use display connection
+				-version           display version and exit
+				-help              display this help text and exit
+HELP
+
+			exit ;;
+
+		-*)
+			1='-help' ;;
 
 		*) break ;;
 	esac
