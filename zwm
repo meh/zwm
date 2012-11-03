@@ -58,6 +58,10 @@ function X:dial {
 	integer REPLY
 	case "$protocol" in
 		unix)
+			if [[ ! -S "$socket$display" ]]; then
+				return 1
+			fi
+
 			zsocket "$socket$display" || return $?
 			DISPLAY_FD=$REPLY
 
@@ -203,12 +207,11 @@ function X:STRING8:write {
 }
 
 function X:STRING8:read {
-	X:read $(( $argv[-1] + (4 - ($argv[-1] % 4) % 4) ))
+	X:read $argv[-1] $1
 
-	REPLY="$REPLY[1,-$(( (4 - ($argv[-1] % 4) % 4) + 1 ))]"
-
-	if (( $+2 )); then
-		typeset -g "$1=$REPLY"
+	if (( $argv[-1] % 4 != 0 )); then
+		local waste
+		X:read $(( 4 - ($argv[-1] % 4) ))
 	fi
 }
 # }}}
@@ -312,9 +315,8 @@ function X:packet:setup:read {
 	X:CARD8:read  "$1[keycode.min]"
 	X:CARD8:read  "$1[keycode.max]"
 
-	# set the literal value for endianness: 0 is little, 1 is big
-	typeset -g "$1[image.byte-order]=${${(P)${:-$1'[image.byte-order]'}/0/little}/1/big}"
-	typeset -g "$1[bitmap-format.byte-order]=${${(P)${:-$1'[bitmap-format.byte-order]'}/0/little}/1/big}"
+	typeset -g "$1[image.byte-order]=${${(P)${:-$1[image.byte-order]}/0/little}/1/big}"
+	typeset -g "$1[bitmap-format.byte-order]=${${(P)${:-$1[bitmap-format.byte-order]}/0/little}/1/big}"
 
 	X:read 4
 	X:STRING8:read "$1[vendor]" $vendor_len
@@ -344,6 +346,7 @@ function X:packet:setup:read {
 		X:CARD16:read   "$1[screens.$i.height.mm]"
 		X:CARD16:read   "$1[screens.$i.installed-maps.min]"
 		X:CARD16:read   "$1[screens.$i.installed-maps.max]"
+		X:VISUALID:read "$1[screens.$i.visual]"
 		X:BYTE:read     "$1[screens.$i.backing-stores]"
 		X:BOOL:read     "$1[screens.$i.save-unders]"
 		X:CARD8:read    "$1[screens.$i.depth]"
@@ -470,6 +473,9 @@ HELP
 	esac
 done
 
-X:connect "$args[display]"
+if ! X:connect "$args[display]"; then
+	warn 'zwm: connection failed'
+	exit 1
+fi
 
 # vim: ft=zsh sts=2 ts=2 sw=2 noet fdm=marker fmr={{{,}}}
