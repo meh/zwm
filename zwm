@@ -13,8 +13,6 @@ emulate -L zsh
 zmodload -i zsh/net/socket
 zmodload -i zsh/system
 zmodload -i zsh/zselect
-
-# setopt XTRACE
 # }}}
 
 # Misc Helpers {{{
@@ -28,6 +26,16 @@ function is-true {
 # }}}
 
 # X Helpers {{{
+function X:args {
+	typeset -gA args
+
+	if (( ! $+2 )); then
+		args=("${(@P)1}")
+	else
+		args=("$@")
+	fi
+}
+
 function X:dial {
 	local display
 	local screen
@@ -51,7 +59,7 @@ function X:dial {
 		protocol='unix'
 	fi
 
-	parts=(${(@s[.])parts[-1]})
+	parts=("${(@s[.])parts[-1]}")
 	display="$parts[1]"
 	screen="$parts[2]"
 
@@ -75,7 +83,7 @@ function X:connect {
 	X:dial $1 || return 1
 	X:auth:read || return 1
 
-	X:packet:setup:write \
+	X:setup:write \
 		endianness big \
 \
 		protocol.version.major 11 \
@@ -85,26 +93,53 @@ function X:connect {
 		auth.data "$reply[data]"
 
 	local -A setup
-	X:packet:setup:read setup
+	X:setup:read setup
 
 	if (( $setup[protocol.version.major] < 11 )); then
-		warn 'WHAT YEAR IS THIS?!?!?'
-		exit 1
+		warn 'zwm: protocol mismatch: WHAT YEAR IS IT!?!?'
+		return 1
 	fi
 
 	if (( $setup[protocol.version.major] > 11 )); then
-		warn 'Tell me about the future.'
-		exit 1
+		warn 'zwm: protocol mismatch: Tell me about the future.'
+		return 1
 	fi
 }
 
+function X:select-input {
+
+}
+
+# I/O {{{
 function X:write {
 	syswrite -o $DISPLAY_FD "$*"
+}
+
+function X:write-padding {
+	local padding
+	repeat $1 padding+=$'\0'
+
+	X:write "$padding"
+}
+
+function X:write-padding-for {
+	if (( $1 % 4 == 0 )); then
+		return
+	fi
+
+	X:write-padding $(( 4 - ($1 % 4) ))
 }
 
 function X:read {
 	sysread -i $DISPLAY_FD -s "$1" $2
 }
+
+function X:read-padding {
+	local waste
+
+	sysread -i $DISPLAY_FD -s "$1" waste
+}
+# }}}
 
 # Types {{{
 function X:XID:write {
@@ -113,9 +148,7 @@ function X:XID:write {
 		return 1
 	fi
 
-	local encoded="\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
-
-	X:write "${(g::)encoded}"
+	X:write "${(g::)${:-\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))}}"
 }
 
 alias X:WINDOW:write=X:XID:write
@@ -148,9 +181,7 @@ function X:BOOL:read {
 }
 
 function X:CARD8:write {
-	local encoded="\x$(( [##16] $1 & 0xff ))"
-
-	X:write "${(g::)encoded}"
+	X:write "${(g::)${:-\x$(( [##16] $1 & 0xff ))}}"
 }
 
 alias X:BYTE:write=X:CARD8:write
@@ -164,9 +195,7 @@ function X:CARD8:read {
 alias X:BYTE:read=X:CARD8:read
 
 function X:CARD16:write {
-	local encoded="\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
-
-	X:write "${(g::)encoded}"
+	X:write "${(g::)${:-\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))}}"
 }
 
 function X:CARD16:read {
@@ -179,9 +208,7 @@ function X:CARD16:read {
 }
 
 function X:CARD32:write {
-	local encoded="\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))"
-
-	X:write "${(g::)encoded}"
+	X:write "${(g::)${:-\x$(( [##16] ($1 >> 24) & 0xff))\x$(( [##16] ($1 >> 16) & 0xff))\x$(( [##16] ($1 >> 8) & 0xff))\x$(( [##16] $1 & 0xff ))}}"
 }
 
 alias X:VISUALID:write=X:CARD32:write
@@ -216,51 +243,38 @@ function X:STRING8:read {
 }
 # }}}
 
-# Packets {{{
-function X:packet:setup {
-	typeset -gA data
+# Enums {{{
+function X:ByteOrder:read {
+	X:CARD8:read
 
-	if (( ! $+2 )); then
-		data=("${(@P)1}")
-	else
-		data=("$@")
-	fi
+	typeset -g "${1:-REPLY}=${${REPLY/0/little}/1/big}"
 }
+# }}}
 
-function X:packet:setup:write {
-	local -A data
-
-	X:packet:setup "$@"
+# Setup {{{
+function X:setup:write {
+	local -A args && X:args "$@"
 
 	# the first byte tells the endianness to use: B for big, l for little
-	if [[ "${data[endianness]:l}" == 'big' ]]; then
+	if [[ "${args[endianness]:l}" == 'big' ]]; then
 		X:write 'B'
-	elif [[ "${data[endianness]:l}" == 'little' ]]; then
+	elif [[ "${args[endianness]:l}" == 'little' ]]; then
 		X:write 'l'
 	else
 		return 1
 	fi
 
-	# there's an unused byte
-	X:write $'\0'
-
-	# the major and minor version for the protocol we talk
-	X:CARD16:write "$data[protocol.version.major]"
-	X:CARD16:write "$data[protocol.version.minor]"
-
-	# the length of the auth name and auth data
-	X:CARD16:write "$#data[auth.name]"
-	X:CARD16:write "$#data[auth.data]"
-
-	# two unused bytes
-	X:write $'\0\0'
-
-	# and the 4 bytes padded auth name and auth data
-	X:STRING8:write "$data[auth.name]"
-	X:STRING8:write "$data[auth.data]"
+	X:write-padding 1
+	X:CARD16:write "$args[protocol.version.major]"
+	X:CARD16:write "$args[protocol.version.minor]"
+	X:CARD16:write "$#args[auth.name]"
+	X:CARD16:write "$#args[auth.data]"
+	X:write-padding 2
+	X:STRING8:write "$args[auth.name]"
+	X:STRING8:write "$args[auth.data]"
 }
 
-function X:packet:setup:read {
+function X:setup:read {
 	: ${1:=reply}
 
 	integer code
@@ -284,41 +298,38 @@ function X:packet:setup:read {
 	if (( $code == 2 )); then
 		integer reason_length
 
-		X:read 5
+		X:read-padding 5
 		X:CARD16:read reason_length
 		X:STRING8:read "$1[reason]" $(( length * 4 ))
 
 		return 2
 	fi
 
-	X:read 1
+	X:read-padding 1
 
 	integer vendor_len
 	integer screens_len
 	integer pixmap_formats_len
 
-	X:CARD16:read "$1[protocol.version.major]"
-	X:CARD16:read "$1[protocol.version.minor]"
+	X:CARD16:read    "$1[protocol.version.major]"
+	X:CARD16:read    "$1[protocol.version.minor]"
 	X:CARD16:read # unused length
-	X:CARD32:read "$1[protocol.version.release-number]"
-	X:CARD32:read "$1[resource-id.base]"
-	X:CARD32:read "$1[resource-id.mask]"
-	X:CARD32:read "$1[motion-buffer.size]"
-	X:CARD16:read vendor_len
-	X:CARD16:read "$1[request.max-length]"
-	X:CARD8:read  screens_len
-	X:CARD8:read  pixmap_formats_len
-	X:CARD8:read  "$1[image.byte-order]"
-	X:CARD8:read  "$1[bitmap-format.byte-order]"
-	X:CARD8:read  "$1[bitmap-format.scanline.unit]"
-	X:CARD8:read  "$1[bitmap-format.scanline.pad]"
-	X:CARD8:read  "$1[keycode.min]"
-	X:CARD8:read  "$1[keycode.max]"
+	X:CARD32:read    "$1[protocol.version.release-number]"
+	X:CARD32:read    "$1[resource-id.base]"
+	X:CARD32:read    "$1[resource-id.mask]"
+	X:CARD32:read    "$1[motion-buffer.size]"
+	X:CARD16:read    vendor_len
+	X:CARD16:read    "$1[request.max-length]"
+	X:CARD8:read     screens_len
+	X:CARD8:read     pixmap_formats_len
+	X:ByteOrder:read "$1[image.byte-order]"
+	X:ByteOrder:read "$1[bitmap-format.byte-order]"
+	X:CARD8:read     "$1[bitmap-format.scanline.unit]"
+	X:CARD8:read     "$1[bitmap-format.scanline.pad]"
+	X:CARD8:read     "$1[keycode.min]"
+	X:CARD8:read     "$1[keycode.max]"
 
-	typeset -g "$1[image.byte-order]=${${(P)${:-$1[image.byte-order]}/0/little}/1/big}"
-	typeset -g "$1[bitmap-format.byte-order]=${${(P)${:-$1[bitmap-format.byte-order]}/0/little}/1/big}"
-
-	X:read 4
+	X:read-padding 4
 	X:STRING8:read "$1[vendor]" $vendor_len
 
 	integer i
@@ -327,7 +338,7 @@ function X:packet:setup:read {
 		X:CARD8:read "$1[pixmap-formats.$i.depth]"
 		X:CARD8:read "$1[pixmap-formats.$i.bits-per-pixel]"
 		X:CARD8:read "$1[pixmap-formats.$i.scanline.pad]"
-		X:read 5
+		X:read-padding 5
 	done
 
 	integer i
@@ -358,9 +369,9 @@ function X:packet:setup:read {
 			integer visuals_len
 
 			X:CARD8:read "$1[screens.$i.allowed-depths.$j.depth]"
-			X:read 1
+			X:read-padding 1
 			X:CARD16:read visuals_len
-			X:read 4
+			X:read-padding 4
 
 			integer h
 			typeset -g "$1[screens.$i.allowed-depths.$j.visuals.length]=$visuals_len"
@@ -392,7 +403,7 @@ function X:auth:read-short {
 	typeset -g "${1:-REPLY}=$(( #first << 8 | #second ))"
 }
 
-function X:auth:read-string {
+function X:auth:read-string { # out variable, descriptor
 	integer fd="$2"
 	integer length
 
@@ -400,7 +411,7 @@ function X:auth:read-string {
 	sysread -i $fd -s $length $1 || return $?
 }
 
-function X:auth:read {
+function X:auth:read { # out variable, display, host
 	local display="$2"
 	local hostname="${3:-$HOST}"
 	local authority="${XAUTHORITY:-$HOME/.Xauthority}"
@@ -450,6 +461,11 @@ while true; do
 
 			shift 2 ;;
 
+		-trace)
+			setopt XTRACE
+
+			shift ;;
+
 		-version)
 			print 'zwm 0.0.1 (http://github.com/meh/zwm)'
 
@@ -460,6 +476,7 @@ while true; do
 				zwm 0.0.1 (http://github.com/meh/zwm)
 				
 				-display <string>  use display connection
+				-trace             enable tracing
 				-version           display version and exit
 				-help              display this help text and exit
 HELP
