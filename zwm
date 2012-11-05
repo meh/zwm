@@ -383,15 +383,79 @@ function X:setup:read {
 				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.red]"
 				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.green]"
 				X:CARD32:read   "$1[screens.$i.allowed-depths.$j.visuals.$h.mask.blue]"
-				X:read 4
+				X:read-padding 4
 			done
 		done
 	done
 }
 # }}}
 
+# Request {{{
+function X:request:header { # Opcode, Size, [out Variable=PADDING]
+	integer _padding && (( _padding = (4 - ($2 % 4)) % 4 ))
+
+	X:CARD8:write "$1"
+	X:write-padding 1
+	X:CARD16:write $(( ($2 + _padding) / 4 ))
+
+	typeset -g "${3:-PADDING}=$_padding"
+}
+
+function X:request:extension-header { # Opcode, Extension Opcode, Size, [out Variable=PADDING]
+	integer _padding && (( _padding = (4 - ($3 % 4)) % 4 ))
+
+	X:CARD8:write "$1"
+	X:CARD8:write "$2"
+	X:CARD16:write $(( ($3 + _padding) / 4 ))
+
+	typeset -g "${4:-PADDING}=$_padding"
+}
+
+typeset -gA XWindowAttributes
+XWindowAttributes=(
+	background.pixmap 0
+	background.pixel  1
+	border.pixmap     2
+	border.pixel      3
+	gravity.bit       4
+	gravity.window    5
+	backing.store     6
+	backing.planes    7
+	backing.pixel     8
+	override-redirect 9
+	save-under        10
+	event-mask        11
+	no-propagate      12
+	colormap          13
+	cursor            14
+)
+
+function X:request:ChangeWindowAttributes { # Window, Attributes
+	local -A args && X:args "${(@)argv[2,-1]}"
+	integer mask
+	local -a values
+
+	for name value ("${(@kv)args}"); do
+		if [[ -n ${(k)XWindowAttributes[(i)$name]} ]]; then
+			let "mask = mask | (1 << $XWindowAttributes[$name])"
+			values+=$args[$name]
+		fi
+	done
+
+	X:request:header 2 $(( 4 + 4 + ($#values) * 4 ))
+	X:WINDOW:write $1
+	X:CARD32:write $mask
+	
+	local value
+	for value ($values[@])
+		X:CARD32:write $value
+
+	X:write-padding $PADDING
+}
+# }}}
+
 # Authentication {{{
-function X:auth:read-short {
+function X:auth:read-short { # out Variable, Descriptor
 	integer fd="$2"
 	local encoded
 
